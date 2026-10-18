@@ -2,16 +2,18 @@ package com.vociferate.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -29,13 +31,33 @@ class MainActivity : Activity() {
     private var projection: MediaProjection? = null
     private var recorder: AudioRecord? = null
     private var captureThread: Thread? = null
-    private var capturing = false
+    @Volatile private var capturing = false
+    private var serviceReady = false
+    private var projectionResultCode: Int? = null
+    private var projectionData: Intent? = null
+    private var receiverRegistered = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         private const val REQUEST_CAPTURE = 1001
         private const val REQUEST_MIC_PERMISSION = 1002
+    }
+
+    private val serviceReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == AudioCaptureService.ACTION_READY) {
+                serviceReady = true
+                val resultCode = projectionResultCode
+                val data = projectionData
+
+                if (resultCode != null && data != null) {
+                    projectionResultCode = null
+                    projectionData = null
+                    beginAudioCapture(resultCode, data)
+                }
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -80,16 +102,12 @@ class MainActivity : Activity() {
 
         val startButton = Button(this).apply {
             text = "Start Internal Audio Capture"
-            setOnClickListener {
-                startCaptureRequest()
-            }
+            setOnClickListener { startCaptureRequest() }
         }
 
         val stopButton = Button(this).apply {
             text = "Stop Capture"
-            setOnClickListener {
-                stopCapture()
-            }
+            setOnClickListener { stopCapture() }
         }
 
         layout.addView(title)
@@ -103,7 +121,7 @@ class MainActivity : Activity() {
     }
 
     private fun startCaptureRequest() {
-        if (capturing) return
+        if (capturing || projectionData != null) return
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -149,7 +167,7 @@ class MainActivity : Activity() {
         )
     }
 
-    @Deprecated("Uses the compatible activity result callback")
+    @Deprecated("Uses compatible activity result callback")
     override fun onActivityResult(
         requestCode: Int,
         resultCode: Int,
@@ -164,6 +182,57 @@ class MainActivity : Activity() {
             return
         }
 
+        projectionResultCode = resultCode
+        projectionData = data
+        serviceReady = false
+        status.text = "Starting secure capture service..."
+
+        val filter = IntentFilter(AudioCaptureService.ACTION_READY)
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                serviceReceiver,
+                filter,
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(serviceReceiver, filter)
+        }
+
+        receiverRegistered = true
+
+        try {
+            val serviceIntent = Intent(
+                this,
+                AudioCaptureService::class.java
+            ).setAction(AudioCaptureService.ACTION_START)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+
+            // Prevent waiting forever if the service fails to start.
+            mainHandler.postDelayed({
+                if (!serviceReady && projectionData != null) {
+                    projectionData = null
+                    projectionResultCode = null
+                    status.text = "Capture service did not start"
+                    stopCapture()
+                }
+            }, 5000)
+
+        } catch (e: Exception) {
+            projectionData = null
+            projectionResultCode = null
+            status.text = "Service error: ${e.message}"
+            stopCapture()
+        }
+    }
+
+    private fun beginAudioCapture(resultCode: Int, data: Intent) {
         try {
             val manager = getSystemService(
                 Context.MEDIA_PROJECTION_SERVICE
@@ -187,13 +256,13 @@ class MainActivity : Activity() {
                 .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                 .build()
 
-            val bufferSize = AudioRecord.getMinBufferSize(
+            val minBufferSize = AudioRecord.getMinBufferSize(
                 16000,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
 
-            if (bufferSize <= 0) {
+            if (minBufferSize <= 0) {
                 throw IllegalStateException(
                     "Unsupported audio recording format"
                 )
@@ -201,32 +270,37 @@ class MainActivity : Activity() {
 
             recorder = AudioRecord.Builder()
                 .setAudioFormat(format)
-                .setBufferSizeInBytes(bufferSize * 2)
+                .setBufferSizeInBytes(minBufferSize * 2)
                 .setAudioPlaybackCaptureConfig(config)
                 .build()
 
-            if (recorder?.state != AudioRecord.STATE_INITIALIZED) {
+            val audioRecorder = recorder
+                ?: throw IllegalStateException("Recorder unavailable")
+
+            if (audioRecorder.state != AudioRecord.STATE_INITIALIZED) {
                 throw IllegalStateException(
                     "Audio recorder initialization failed"
                 )
             }
 
-            recorder?.startRecording()
+            audioRecorder.startRecording()
             capturing = true
 
             status.text = "Capturing eligible internal audio"
             level.text = "Audio level: waiting for sound"
 
             captureThread = Thread {
-                val audioBuffer = ShortArray(bufferSize)
+                val audioBuffer = ShortArray(
+                    (minBufferSize / 2).coerceAtLeast(512)
+                )
 
                 while (capturing) {
                     val count = try {
-                        recorder?.read(
+                        audioRecorder.read(
                             audioBuffer,
                             0,
                             audioBuffer.size
-                        ) ?: -1
+                        )
                     } catch (_: Exception) {
                         -1
                     }
@@ -262,8 +336,8 @@ class MainActivity : Activity() {
             }
 
         } catch (e: Exception) {
-            stopCapture()
             status.text = "Capture error: ${e.message ?: "Unknown error"}"
+            stopCapture()
         }
     }
 
@@ -289,12 +363,31 @@ class MainActivity : Activity() {
 
         projection = null
         captureThread = null
+        projectionData = null
+        projectionResultCode = null
+        serviceReady = false
+
+        if (receiverRegistered) {
+            try {
+                unregisterReceiver(serviceReceiver)
+            } catch (_: Exception) {
+            }
+            receiverRegistered = false
+        }
+
+        try {
+            stopService(
+                Intent(this, AudioCaptureService::class.java)
+            )
+        } catch (_: Exception) {
+        }
 
         status.text = "Capture stopped"
         level.text = "Audio level: --"
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
         stopCapture()
         super.onDestroy()
     }
